@@ -1,0 +1,197 @@
+name: Upstream
+
+# Google publishes the CLI whenever it likes, and its release feed has no
+# webhook, so this polls hourly. It is the repository's release: a new
+# upstream version is the only thing that tags.
+#
+# The version only reaches trunk after it has actually built and run on both
+# architectures. That is why this pushes straight to trunk instead of opening
+# a pull request: a PR raised by GITHUB_TOKEN does not trigger workflows, so
+# an auto-merged one would land unverified.
+#
+# The weekly move of the flake's inputs is the Weekly update, in update.yml.
+# Both commit to trunk, so they share the concurrency group "update".
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.update.outputs.updated }}
+      version: ${{ steps.update.outputs.version }}
+      build: ${{ steps.update.outputs.build }}
+      previous: ${{ steps.update.outputs.previous }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check Google's release feed for a newer release
+        id: update
+        run: |
+          previous="$(jq -r .version sources.json)"
+          echo "previous=$previous" >>"$GITHUB_OUTPUT"
+
+          nix develop --command ./scripts/update.sh
+
+          echo "version=$(jq -r .version sources.json)" >>"$GITHUB_OUTPUT"
+          echo "build=$(jq -r .build sources.json)" >>"$GITHUB_OUTPUT"
+
+          if git diff --quiet -- sources.json; then
+            echo "updated=false" >>"$GITHUB_OUTPUT"
+            echo "Already at $previous." >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "updated=true" >>"$GITHUB_OUTPUT"
+            echo "\`$previous\` -> \`$(jq -r .version sources.json)\`" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the candidate sources.json
+        if: steps.update.outputs.updated == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sources
+          path: sources.json
+          retention-days: 1
+
+  verify:
+    needs: check
+    if: needs.check.outputs.updated == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sources
+
+      - uses: ./.github/actions/build
+        with:
+          system: ${{ matrix.system }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: [check, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sources
+
+      - name: Commit, tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+          BUILD: ${{ needs.check.outputs.build }}
+          PREVIOUS: ${{ needs.check.outputs.previous }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add sources.json
+          git commit \
+            -m "antigravity-cli: $PREVIOUS -> $VERSION (build $BUILD)" \
+            -m "Hashes from Google's release feed, each checked against the downloaded tarball. Built and run on x86_64-linux and aarch64-linux before landing."
+          git pull --rebase origin trunk
+          git push origin HEAD:trunk
+
+          # A tag per release, so a consumer can pin one exactly. Google's
+          # version is the short one (1.5.13) and the build suffix is only in
+          # the download URL, so the tag is v<version>. If Google ever
+          # republishes a version under a new build, that tag is taken and
+          # the new one carries the build too, rather than failing the
+          # release or moving a tag someone has pinned.
+          tag="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            tag="v$VERSION-$BUILD"
+          fi
+          git tag -a "$tag" -m "antigravity-cli $VERSION (build $BUILD)"
+          git push origin "$tag"
+
+          # printf rather than a heredoc, whose body would carry this block's
+          # YAML indentation into the release notes.
+          printf '%s\n' \
+            "Antigravity CLI \`$VERSION\` (build \`$BUILD\`), repackaged from Google's release feed." \
+            "" \
+            "Pin this version:" \
+            "" \
+            '```nix' \
+            "inputs.antigravity-cli.url = \"github:$REPOSITORY/$tag\";" \
+            '```' \
+            >notes.md
+
+          gh release create "$tag" \
+            --title "antigravity-cli $VERSION" \
+            --notes-file notes.md
+
+  # An hourly job that fails goes unnoticed in the Actions tab, so a failure
+  # opens one issue, labelled auto-failure, and each later failure comments on
+  # it instead of opening another. The first green run closes it again. A run
+  # that found nothing new counts as green: publish is skipped, not failed.
+  report:
+    needs: [check, verify, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RESULTS: ${{ join(needs.*.result, ' ') }}
+    steps:
+      - name: Open, update or close the auto-failure issue
+        run: |
+          existing="$(gh issue list --label auto-failure --state open --json number --jq '.[0].number // empty')"
+
+          case " $RESULTS " in
+            *" failure "* | *" cancelled "*)
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --body "Failed again: $RUN_URL"
+              else
+                gh label create auto-failure --color B60205 \
+                  --description "The hourly upstream check is failing" 2>/dev/null || true
+                gh issue create --label auto-failure \
+                  --title "Upstream check is failing" \
+                  --body "The hourly upstream check failed: $RUN_URL
+
+          This issue closes itself when a run succeeds."
+              fi
+              ;;
+            *)
+              if [ -n "$existing" ]; then
+                gh issue close "$existing" --comment "Recovered: $RUN_URL"
+              fi
+              ;;
+          esac
